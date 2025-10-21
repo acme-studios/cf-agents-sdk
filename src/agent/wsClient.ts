@@ -5,24 +5,32 @@ export type AgentState = {
   messages: { role: "user" | "assistant"; content: string; ts: number }[];
 };
 
-/** Tool event shape (getWeather v1) */
+// Type-only imports for tool results (erased at build time)
+export type WeatherResult = import("../../worker/tools/getWeather").WeatherResult;
+export type WikiResult    = import("../../worker/tools/getWiki").WikiResult;
+
+/** Tool event shape (weather + wiki) */
 export type ToolEvent =
   | { type: "tool"; tool: "getWeather"; status: "started"; message?: string }
   | { type: "tool"; tool: "getWeather"; status: "step";    message?: string }
-  | { type: "tool"; tool: "getWeather"; status: "done";    message?: string; result: unknown }
-  | { type: "tool"; tool: "getWeather"; status: "error";   message: string };
+  | { type: "tool"; tool: "getWeather"; status: "done";    message?: string; result: WeatherResult }
+  | { type: "tool"; tool: "getWeather"; status: "error";   message: string }
+  | { type: "tool"; tool: "getWiki";    status: "started"; message?: string }
+  | { type: "tool"; tool: "getWiki";    status: "step";    message?: string }
+  | { type: "tool"; tool: "getWiki";    status: "done";    message?: string; result: WikiResult }
+  | { type: "tool"; tool: "getWiki";    status: "error";   message: string };
 
 export class AgentClient {
   private ws: WebSocket | null = null;
 
-  onReady: (s: AgentState) => void = () => {};
-  onDelta: (t: string) => void = () => {};
-  onDone:  () => void = () => {};
-  onCleared: () => void = () => {};
-  /** New: tool progress/result hook */
-  onTool: (evt: ToolEvent) => void = () => {};
+  onReady:    (s: AgentState) => void = () => {};
+  onDelta:    (t: string) => void     = () => {};
+  onDone:     () => void              = () => {};
+  onCleared:  () => void              = () => {};
+  /** For progress/results cards */
+  onTool:     (evt: ToolEvent) => void = () => {};
 
-  isOpen() { return this.ws?.readyState === WebSocket.OPEN; }
+  isOpen()       { return this.ws?.readyState === WebSocket.OPEN; }
   isConnecting() { return this.ws?.readyState === WebSocket.CONNECTING; }
 
   async connect(): Promise<void> {
@@ -46,27 +54,11 @@ export class AgentClient {
       try {
         const msg = JSON.parse(ev.data);
 
-        if (msg?.type === "ready") {
-          this.onReady(msg.state as AgentState);
-          return;
-        }
-        if (msg?.type === "delta") {
-          this.onDelta(String(msg.text ?? ""));
-          return;
-        }
-        if (msg?.type === "done") {
-          this.onDone();
-          return;
-        }
-        if (msg?.type === "cleared") {
-          this.onCleared();
-          return;
-        }
-        // NEW: forward tool progress/results to UI
-        if (msg?.type === "tool") {
-          this.onTool(msg as ToolEvent);
-          return;
-        }
+        if (msg?.type === "ready")   { this.onReady(msg.state as AgentState); return; }
+        if (msg?.type === "delta")   { this.onDelta(String(msg.text ?? ""));  return; }
+        if (msg?.type === "done")    { this.onDone();                          return; }
+        if (msg?.type === "cleared") { this.onCleared();                       return; }
+        if (msg?.type === "tool")    { this.onTool(msg as ToolEvent);          return; }
       } catch {
         // ignore malformed frames
       }

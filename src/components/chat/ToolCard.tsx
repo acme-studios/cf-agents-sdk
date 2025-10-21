@@ -3,7 +3,7 @@
 /** Progress types */
 export type StepState = "idle" | "active" | "done" | "error";
 export type ToolProgress = {
-  tool: "getWeather" | string;
+  tool: "getWeather" | "getWiki";
   phase: "running" | "done" | "error";
   steps: Array<{ key: string; label: string; state: StepState; note?: string }>;
   error?: string;
@@ -23,8 +23,15 @@ export type ToolUI =
       subtitle?: string;
     }
   | {
-      // Rendered by the app with <WeatherWidget />, ToolCard won't render this.
+      // Rendered by the app with <WeatherWidget />
       kind: "weather";
+      title?: string;
+      subtitle?: string;
+      data?: unknown;
+    }
+  | {
+      // Rendered by the app with <WikiWidget />
+      kind: "wiki";
       title?: string;
       subtitle?: string;
       data?: unknown;

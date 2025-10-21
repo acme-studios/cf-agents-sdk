@@ -2,11 +2,13 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AgentClient, type AgentState } from "./agent/wsClient";
 import { ToolCard, type ToolUI } from "./components/chat/ToolCard";
 import { WeatherWidget } from "./components/chat/WeatherWidget";
-import type { WeatherResult } from "../worker/tools/getWeather"; // <- use the worker's type
+import { WikiWidget } from "./components/chat/WikiWidget";
+
+import type { WeatherResult } from "../worker/tools/getWeather";
+import type { WikiResult } from "../worker/tools/getWiki";
+
 import "./index.css";
 import "./App.css";
-
-type ToolUIProgress = Extract<ToolUI, { kind: "progress" }>;
 
 /* ---------------------------- tiny markdown ---------------------------- */
 
@@ -65,25 +67,22 @@ function mdToHtml(input: string): string {
 
 /* ----------------------------- UI types -------------------------------- */
 
-// Chat union now supports:
-//  - plain user/assistant bubbles
-//  - progress/generic tool cards (ToolUI)
-//  - a dedicated weather widget message (separate from ToolUI)
+/** What we render in the chat list */
 export type ChatMessage =
   | { id: string; role: "user" | "assistant"; content: string }
   | { id: string; role: "tool"; toolUI: ToolUI }
-  | { id: string; role: "tool"; weather: WeatherResult };
+  | { id: string; role: "tool"; weather: WeatherResult }
+  | { id: string; role: "tool"; wiki: WikiResult };
 
-/** Tool event shape coming from the server */
+/** Tool events the WS can deliver */
 type ToolEvent =
-  | { type: "tool"; tool: "getWeather"; status: "started"; message?: string }
-  | { type: "tool"; tool: "getWeather"; status: "step"; message?: string }
-  | { type: "tool"; tool: "getWeather"; status: "done"; message?: string; result: WeatherResult }
-  | { type: "tool"; tool: "getWeather"; status: "error"; message: string };
+  | { type: "tool"; tool: "getWeather"; status: "started" | "step" | "done" | "error"; message?: string; result?: WeatherResult }
+  | { type: "tool"; tool: "getWiki";    status: "started" | "step" | "done" | "error"; message?: string; result?: WikiResult };
 
 /* ------------------------- Type guards / helpers ------------------------ */
 
 type ServerMsgRow = { role: string; content: string; ts: number };
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
 }
@@ -96,22 +95,32 @@ function hasNum<K extends string>(obj: Record<string, unknown>, key: K): obj is 
 function isServerMsgRow(v: unknown): v is ServerMsgRow {
   return isRecord(v) && hasStr(v, "role") && hasStr(v, "content") && hasNum(v, "ts");
 }
+
 function isToolEvent(v: unknown): v is ToolEvent {
   if (!isRecord(v)) return false;
-  if ((v as { type?: unknown }).type !== "tool") return false;
-  if ((v as { tool?: unknown }).tool !== "getWeather") return false;
-  const status = (v as { status?: unknown }).status;
-  return status === "started" || status === "step" || status === "done" || status === "error";
+  if (v.type !== "tool") return false;
+  const tool = v.tool;
+  const status = v.status;
+  const toolOk = tool === "getWeather" || tool === "getWiki";
+  const statusOk = status === "started" || status === "step" || status === "done" || status === "error";
+  return toolOk && statusOk;
 }
+
 function isWeatherResult(v: unknown): v is WeatherResult {
   if (!isRecord(v) || typeof v.ok !== "boolean") return false;
   if (v.ok === false) return hasStr(v, "error");
   return isRecord(v.place) && isRecord(v.units) && Array.isArray(v.daily);
 }
+function isWikiResult(v: unknown): v is WikiResult {
+  if (!isRecord(v) || typeof v.ok !== "boolean") return false;
+  if (v.ok === false) return hasStr(v, "error");
+  return hasStr(v, "title") && hasStr(v, "extract") && hasStr(v, "pageUrl") && hasStr(v, "lang");
+}
 
 /* --------------------------- Progress helpers --------------------------- */
 
 type StepState = "idle" | "active" | "done" | "error";
+type ToolUIProgress = Extract<ToolUI, { kind: "progress" }>;
 
 function initialWeatherProgress(): ToolUI {
   return {
@@ -121,75 +130,68 @@ function initialWeatherProgress(): ToolUI {
       tool: "getWeather",
       phase: "running",
       steps: [
-        { key: "plan",  label: "Plan intent",       state: "active" as StepState },
-        { key: "fetch", label: "Fetch from Open-Meteo API",    state: "idle"   as StepState },
-        { key: "parse", label: "Parse forecast",    state: "idle"   as StepState },
-        { key: "final", label: "Finalize",          state: "idle"   as StepState },
+        { key: "plan",  label: "Plan intent",               state: "active" as StepState },
+        { key: "fetch", label: "Fetch from Open-Meteo API", state: "idle"   as StepState },
+        { key: "parse", label: "Parse forecast",            state: "idle"   as StepState },
+        { key: "final", label: "Finalize",                  state: "idle"   as StepState },
+      ],
+    },
+  };
+}
+function initialWikiProgress(): ToolUI {
+  return {
+    kind: "progress",
+    title: "Wikipedia",
+    progress: {
+      tool: "getWiki",
+      phase: "running",
+      steps: [
+        { key: "plan",  label: "Understand query", state: "active" as StepState },
+        { key: "search",label: "Search Wikipedia", state: "idle"   as StepState },
+        { key: "fetch", label: "Fetch summary",    state: "idle"   as StepState },
+        { key: "final", label: "Finalize",         state: "idle"   as StepState },
       ],
     },
   };
 }
 function setStepState(ui: ToolUI, key: string, state: StepState): ToolUI {
-  if (ui.kind !== "progress" || !ui.progress) return ui;
+  if (ui.kind !== "progress") return ui;
   const steps = ui.progress.steps.map((s) => (s.key === key ? { ...s, state } : s));
   return { ...ui, progress: { ...ui.progress, steps } };
 }
 function markSequence(ui: ToolUI, activate: string, doneKeys: string[]): ToolUI {
-  let next = ui;
+  let next: ToolUI = ui;
   for (const k of doneKeys) next = setStepState(next, k, "done");
-  next = setStepState(next, activate, "active");
-  return next;
+  return setStepState(next, activate, "active");
 }
-// IMPORTANT: return an explicit "progress" object (don’t spread a possibly-generic base)
 function finalizeProgress(ui?: ToolUI): ToolUI {
-  // Pin to the "progress" variant so .progress is guaranteed to exist
-  const base: ToolUIProgress =
-    ui && ui.kind === "progress" ? ui : (initialWeatherProgress() as ToolUIProgress);
-
-  const steps = base.progress.steps.map((s) =>
-    s.state === "done" ? s : { ...s, state: "done" as StepState }
-  );
-
-  return {
-    kind: "progress",
-    title: base.title,
-    subtitle: base.subtitle,
-    progress: { ...base.progress, phase: "done", steps },
-  };
+  const base: ToolUIProgress = ui && ui.kind === "progress" ? ui : (initialWeatherProgress() as ToolUIProgress);
+  const steps = base.progress.steps.map((s) => (s.state === "done" ? s : { ...s, state: "done" as StepState }));
+  return { kind: "progress", title: base.title, subtitle: base.subtitle, progress: { ...base.progress, phase: "done", steps } };
 }
-
 function errorProgress(ui?: ToolUI, msg?: string): ToolUI {
-  const base: ToolUIProgress =
-    ui && ui.kind === "progress" ? ui : (initialWeatherProgress() as ToolUIProgress);
-
-  // Mark whichever step is currently "active" as "error", others unchanged
-  const steps = base.progress.steps.map((s) =>
-    s.state === "active" ? { ...s, state: "error" as const } : s
-  );
-
+  const base: ToolUIProgress = ui && ui.kind === "progress" ? ui : (initialWeatherProgress() as ToolUIProgress);
+  const steps = base.progress.steps.map((s) => (s.state === "active" ? { ...s, state: "error" as const } : s));
   return {
     kind: "progress",
     title: base.title,
     subtitle: base.subtitle,
-    progress: {
-      ...base.progress,
-      phase: "error",
-      error: msg ?? "Something went wrong",
-      steps,
-    },
+    progress: { ...base.progress, phase: "error", error: msg ?? "Something went wrong", steps },
   };
 }
-function upsertWeatherProgress(
+function upsertProgressFor(
+  tool: "getWeather" | "getWiki",
+  init: () => ToolUI,
   mutator: (prev?: ToolUI) => ToolUI,
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>
 ) {
   setMessages((prev) => {
     const next = [...prev];
     const revIdx = [...next].reverse().findIndex(
-      (m) => m.role === "tool" && "toolUI" in m && m.toolUI.kind === "progress" && m.toolUI.progress?.tool === "getWeather"
+      (m) => m.role === "tool" && "toolUI" in m && m.toolUI.kind === "progress" && m.toolUI.progress.tool === tool
     );
     if (revIdx === -1) {
-      next.push({ id: crypto.randomUUID(), role: "tool", toolUI: mutator(undefined) });
+      next.push({ id: crypto.randomUUID(), role: "tool", toolUI: mutator(init()) });
       return next;
     }
     const idx = next.length - 1 - revIdx;
@@ -262,7 +264,7 @@ export default function App() {
   const clientRef = useRef<AgentClient | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // Theme (self-contained)
+  // Theme
   const [theme, setTheme] = useState<"light" | "dark">(() => {
     if (typeof window !== "undefined") {
       const stored = localStorage.getItem("theme");
@@ -293,36 +295,42 @@ export default function App() {
             // Tool rows are JSON-encoded by the worker
             try {
               const payload = JSON.parse(r.content) as unknown;
+
+              // Weather restore
               if (
                 isRecord(payload) &&
-                (payload as { tool?: unknown }).tool === "getWeather" &&
+                payload.tool === "getWeather" &&
                 isWeatherResult((payload as { result?: unknown }).result)
               ) {
-                // Show: finished progress then weather widget
+                restored.push({ id: crypto.randomUUID(), role: "tool", toolUI: finalizeProgress(initialWeatherProgress()) });
+                restored.push({ id: crypto.randomUUID(), role: "tool", weather: (payload as { result: WeatherResult }).result });
+                continue;
+              }
+
+              // Wiki restore
+              if (
+                isRecord(payload) &&
+                payload.tool === "getWiki" &&
+                isWikiResult((payload as { result?: unknown }).result)
+              ) {
+                // optional: show a tiny finished progress card for parity
                 restored.push({
                   id: crypto.randomUUID(),
                   role: "tool",
-                  toolUI: finalizeProgress(initialWeatherProgress()),
+                  toolUI: finalizeProgress(initialWikiProgress()),
                 });
-                restored.push({
-                  id: crypto.randomUUID(),
-                  role: "tool",
-                  weather: (payload as { result: WeatherResult }).result,
-                });
+                restored.push({ id: crypto.randomUUID(), role: "tool", wiki: (payload as { result: WikiResult }).result });
                 continue;
               }
             } catch {
-              // ignore; fall through to neutral card
+              // ignore; fallthrough to neutral card
             }
-            restored.push({
-              id: crypto.randomUUID(),
-              role: "tool",
-              toolUI: { kind: "generic", title: "Tool", subtitle: "Result available" },
-            });
+
+            restored.push({ id: crypto.randomUUID(), role: "tool", toolUI: { kind: "generic", title: "Tool", subtitle: "Result available" } });
             continue;
           }
 
-          // user/assistant
+          // user/assistant rows
           restored.push({ id: crypto.randomUUID(), role: r.role as "user" | "assistant", content: r.content });
         }
         if (restored.length) setMessages(restored);
@@ -349,32 +357,63 @@ export default function App() {
       setMessages([]);
     };
 
-    // Tool events (weather)
+    // Tool events (weather + wiki)
     client.onTool = (raw: unknown) => {
       if (!isToolEvent(raw)) return;
       const evt = raw;
 
-      if (evt.status === "started") {
-        setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "tool", toolUI: initialWeatherProgress() }]);
-      } else if (evt.status === "step") {
-        const msg = (evt.message ?? "").toLowerCase();
-        upsertWeatherProgress((prev) => {
-          const base = prev && prev.kind === "progress" ? prev : initialWeatherProgress();
-          if (msg.includes("fetch")) return markSequence(base, "fetch", ["plan"]);
-          if (msg.includes("pars")) return markSequence(base, "parse", ["plan", "fetch"]);
-          if (msg.includes("final")) return markSequence(base, "final", ["plan", "fetch", "parse"]);
-          return base;
-        }, setMessages);
-      } else if (evt.status === "done") {
-        upsertWeatherProgress((prev) => finalizeProgress(prev ?? initialWeatherProgress()), setMessages);
-        if (isWeatherResult(evt.result)) {
-          setMessages((prev) => [
-            ...prev,
-            { id: crypto.randomUUID(), role: "tool", weather: evt.result },
-          ]);
+      if (evt.tool === "getWeather") {
+        if (evt.status === "started") {
+          setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "tool", toolUI: initialWeatherProgress() }]);
+        } else if (evt.status === "step") {
+          const msg = (evt.message ?? "").toLowerCase();
+          upsertProgressFor(
+            "getWeather",
+            initialWeatherProgress,
+            (prev) => {
+              const base = prev && prev.kind === "progress" ? prev : initialWeatherProgress();
+              if (msg.includes("fetch")) return markSequence(base, "fetch", ["plan"]);
+              if (msg.includes("pars")) return markSequence(base, "parse", ["plan", "fetch"]);
+              if (msg.includes("final")) return markSequence(base, "final", ["plan", "fetch", "parse"]);
+              return base;
+            },
+            setMessages
+          );
+        } else if (evt.status === "done") {
+          upsertProgressFor("getWeather", initialWeatherProgress, (prev) => finalizeProgress(prev), setMessages);
+          if (evt.result && isWeatherResult(evt.result)) {
+            setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "tool", weather: evt.result } as ChatMessage]);
+          }
+        } else if (evt.status === "error") {
+          upsertProgressFor("getWeather", initialWeatherProgress, (prev) => errorProgress(prev, evt.message), setMessages);
         }
-      } else if (evt.status === "error") {
-        upsertWeatherProgress((prev) => errorProgress(prev ?? initialWeatherProgress(), evt.message), setMessages);
+      }
+
+      if (evt.tool === "getWiki") {
+        if (evt.status === "started") {
+          setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "tool", toolUI: initialWikiProgress() }]);
+        } else if (evt.status === "step") {
+          const msg = (evt.message ?? "").toLowerCase();
+          upsertProgressFor(
+            "getWiki",
+            initialWikiProgress,
+            (prev) => {
+              const base = prev && prev.kind === "progress" ? prev : initialWikiProgress();
+              if (msg.includes("search")) return markSequence(base, "search", ["plan"]);
+              if (msg.includes("fetch"))  return markSequence(base, "fetch",  ["plan", "search"]);
+              if (msg.includes("final"))  return markSequence(base, "final",  ["plan", "search", "fetch"]);
+              return base;
+            },
+            setMessages
+          );
+        } else if (evt.status === "done") {
+          upsertProgressFor("getWiki", initialWikiProgress, (prev) => finalizeProgress(prev), setMessages);
+          if (evt.result && isWikiResult(evt.result)) {
+            setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "tool", wiki: evt.result } as ChatMessage]);
+          }
+        } else if (evt.status === "error") {
+          upsertProgressFor("getWiki", initialWikiProgress, (prev) => errorProgress(prev, evt.message), setMessages);
+        }
       }
     };
 
@@ -387,7 +426,9 @@ export default function App() {
       }
     })();
 
-    return () => { /* keep WS open */ };
+    return () => {
+      /* keep WS open */
+    };
   }, []);
 
   // auto-scroll
@@ -456,12 +497,23 @@ export default function App() {
                   <div className="flex flex-col gap-3">
                     {messages.map((m) => {
                       if (m.role === "tool") {
-                        // Render either the widget or a progress/generic card
-                        return "weather" in m ? (
-                          <div key={m.id} className="px-1">
-                            <WeatherWidget result={m.weather} />
-                          </div>
-                        ) : (
+                        // Widgets first
+                        if ("weather" in m) {
+                          return (
+                            <div key={m.id} className="px-1">
+                              <WeatherWidget result={m.weather} />
+                            </div>
+                          );
+                        }
+                        if ("wiki" in m) {
+                          return (
+                            <div key={m.id} className="px-1">
+                              <WikiWidget result={m.wiki} />
+                            </div>
+                          );
+                        }
+                        // Otherwise progress/generic card
+                        return (
                           <div key={m.id} className="px-1">
                             <ToolCard ui={(m as Extract<ChatMessage, { toolUI: ToolUI }>).toolUI} />
                           </div>
