@@ -12,6 +12,8 @@
 		"cf-typegen": "wrangler types"
 	},
 	"dependencies": {
+		"@tailwindcss/vite": "^4.1.14",
+		"agents": "^0.2.8",
 		"react": "^19.1.1",
 		"react-dom": "^19.1.1"
 	},

@@ -1,68 +1,73 @@
+@import "tailwindcss";
+
+/* Make dark: utilities respond to a .dark class on <html> */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Light/Dark tokens */
 :root {
-  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
-
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  --bg: 245 245 247;
+  --fg: 17 24 39;
+  --card: 255 255 255;
+  --muted: 107 114 128;
 }
 
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-a:hover {
-  color: #535bf2;
-}
-
-body {
-  margin: 0;
-  display: flex;
-  place-items: center;
-  min-width: 320px;
-  min-height: 100vh;
-}
-
-h1 {
-  font-size: 3.2em;
-  line-height: 1.1;
-}
-
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  background-color: #1a1a1a;
-  cursor: pointer;
-  transition: border-color 0.25s;
-}
-button:hover {
-  border-color: #646cff;
-}
-button:focus,
-button:focus-visible {
-  outline: 4px auto -webkit-focus-ring-color;
-}
-
-@media (prefers-color-scheme: light) {
+/* Optional: OS default */
+@media (prefers-color-scheme: dark) {
   :root {
-    color: #213547;
-    background-color: #ffffff;
+    --bg: 10 10 12;
+    --fg: 243 244 246;
+    --card: 20 20 24;
+    --muted: 163 163 163;
   }
-  a:hover {
-    color: #747bff;
-  }
-  button {
-    background-color: #f9f9f9;
-  }
+}
+
+/* IMPORTANT: respond to .dark on <html> */
+.dark {
+  --bg: 10 10 12;
+  --fg: 243 244 246;
+  --card: 20 20 24;
+  --muted: 163 163 163;
+}
+
+/* App background */
+.bg-app {
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(59,130,246,0.12), transparent 60%),
+    radial-gradient(900px 500px at -10% 20%, rgba(168,85,247,0.1), transparent 60%),
+    rgb(var(--bg));
+}
+
+/* Card surface (glass-y) */
+.card-surface {
+  @apply rounded-2xl border border-neutral-200/60 dark:border-neutral-800/60 bg-white/80 dark:bg-neutral-900/60 backdrop-blur-md;
+}
+
+/* Scroll area */
+.chat-scroll {
+  scrollbar-gutter: stable both-edges;
+}
+.chat-scroll::-webkit-scrollbar {
+  height: 8px; width: 8px;
+}
+.chat-scroll::-webkit-scrollbar-thumb {
+  background: rgba(120,120,120,0.35); border-radius: 999px;
+}
+
+
+/* Ensure the whole page background uses the tokens (light/dark) */
+html, body { height: 100%; background: rgb(var(--bg)); color: rgb(var(--fg)); font-family: "Quicksand"; }
+
+/* Redundant but explicit: when .dark is on <html>, inherit tokens */
+.dark html, .dark body,
+.light html, .light body {
+  background: rgb(var(--bg));
+  color: rgb(var(--fg));
+}
+
+/* Force light tokens when .light is set on <html> */
+.light {
+  --bg: 245 245 247; /* light */
+  --fg: 17 24 39;
+  --card: 255 255 255;
+  --muted: 107 114 128;
 }

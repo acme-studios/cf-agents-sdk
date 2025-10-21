@@ -6,6 +6,10 @@ declare namespace Cloudflare {
 		mainModule: typeof import("./worker/index");
 	}
 	interface Env {
+        ASSETS: Asset;
+        AI: Ai;
+        AI_AGENT: DurableObjectNamespace;
+        
 	}
 }
 interface Env extends Cloudflare.Env {}
