@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AgentClient, type AgentState } from "./agent/wsClient";
+import { ToolCard, type ToolUI } from "./components/chat/ToolCard";
+import { WeatherWidget } from "./components/chat/WeatherWidget";
+import type { WeatherResult } from "../worker/tools/getWeather"; // <- use the worker's type
 import "./index.css";
 import "./App.css";
+
+type ToolUIProgress = Extract<ToolUI, { kind: "progress" }>;
 
 /* ---------------------------- tiny markdown ---------------------------- */
 
@@ -9,12 +14,7 @@ function escapeHtml(s: string) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** Small, safe-ish markdown renderer:
- *  - paragraphs, #/##/### headings
- *  - **bold**, *italics*, `inline code`, ``` fenced ```
- *  - links [text](https://…)
- *  - very simple lists (- or *)
- */
+/** Small, safe-ish markdown renderer */
 function mdToHtml(input: string): string {
   let s = input.replace(/\r\n/g, "\n");
   s = escapeHtml(s);
@@ -65,7 +65,139 @@ function mdToHtml(input: string): string {
 
 /* ----------------------------- UI types -------------------------------- */
 
-type ChatMessage = { id: string; role: "user" | "assistant"; content: string };
+// Chat union now supports:
+//  - plain user/assistant bubbles
+//  - progress/generic tool cards (ToolUI)
+//  - a dedicated weather widget message (separate from ToolUI)
+export type ChatMessage =
+  | { id: string; role: "user" | "assistant"; content: string }
+  | { id: string; role: "tool"; toolUI: ToolUI }
+  | { id: string; role: "tool"; weather: WeatherResult };
+
+/** Tool event shape coming from the server */
+type ToolEvent =
+  | { type: "tool"; tool: "getWeather"; status: "started"; message?: string }
+  | { type: "tool"; tool: "getWeather"; status: "step"; message?: string }
+  | { type: "tool"; tool: "getWeather"; status: "done"; message?: string; result: WeatherResult }
+  | { type: "tool"; tool: "getWeather"; status: "error"; message: string };
+
+/* ------------------------- Type guards / helpers ------------------------ */
+
+type ServerMsgRow = { role: string; content: string; ts: number };
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+function hasStr<K extends string>(obj: Record<string, unknown>, key: K): obj is Record<K, string> {
+  return key in obj && typeof obj[key] === "string";
+}
+function hasNum<K extends string>(obj: Record<string, unknown>, key: K): obj is Record<K, number> {
+  return key in obj && typeof obj[key] === "number";
+}
+function isServerMsgRow(v: unknown): v is ServerMsgRow {
+  return isRecord(v) && hasStr(v, "role") && hasStr(v, "content") && hasNum(v, "ts");
+}
+function isToolEvent(v: unknown): v is ToolEvent {
+  if (!isRecord(v)) return false;
+  if ((v as { type?: unknown }).type !== "tool") return false;
+  if ((v as { tool?: unknown }).tool !== "getWeather") return false;
+  const status = (v as { status?: unknown }).status;
+  return status === "started" || status === "step" || status === "done" || status === "error";
+}
+function isWeatherResult(v: unknown): v is WeatherResult {
+  if (!isRecord(v) || typeof v.ok !== "boolean") return false;
+  if (v.ok === false) return hasStr(v, "error");
+  return isRecord(v.place) && isRecord(v.units) && Array.isArray(v.daily);
+}
+
+/* --------------------------- Progress helpers --------------------------- */
+
+type StepState = "idle" | "active" | "done" | "error";
+
+function initialWeatherProgress(): ToolUI {
+  return {
+    kind: "progress",
+    title: "Weather",
+    progress: {
+      tool: "getWeather",
+      phase: "running",
+      steps: [
+        { key: "plan",  label: "Plan intent",       state: "active" as StepState },
+        { key: "fetch", label: "Fetch from Open-Meteo API",    state: "idle"   as StepState },
+        { key: "parse", label: "Parse forecast",    state: "idle"   as StepState },
+        { key: "final", label: "Finalize",          state: "idle"   as StepState },
+      ],
+    },
+  };
+}
+function setStepState(ui: ToolUI, key: string, state: StepState): ToolUI {
+  if (ui.kind !== "progress" || !ui.progress) return ui;
+  const steps = ui.progress.steps.map((s) => (s.key === key ? { ...s, state } : s));
+  return { ...ui, progress: { ...ui.progress, steps } };
+}
+function markSequence(ui: ToolUI, activate: string, doneKeys: string[]): ToolUI {
+  let next = ui;
+  for (const k of doneKeys) next = setStepState(next, k, "done");
+  next = setStepState(next, activate, "active");
+  return next;
+}
+// IMPORTANT: return an explicit "progress" object (don’t spread a possibly-generic base)
+function finalizeProgress(ui?: ToolUI): ToolUI {
+  // Pin to the "progress" variant so .progress is guaranteed to exist
+  const base: ToolUIProgress =
+    ui && ui.kind === "progress" ? ui : (initialWeatherProgress() as ToolUIProgress);
+
+  const steps = base.progress.steps.map((s) =>
+    s.state === "done" ? s : { ...s, state: "done" as StepState }
+  );
+
+  return {
+    kind: "progress",
+    title: base.title,
+    subtitle: base.subtitle,
+    progress: { ...base.progress, phase: "done", steps },
+  };
+}
+
+function errorProgress(ui?: ToolUI, msg?: string): ToolUI {
+  const base: ToolUIProgress =
+    ui && ui.kind === "progress" ? ui : (initialWeatherProgress() as ToolUIProgress);
+
+  // Mark whichever step is currently "active" as "error", others unchanged
+  const steps = base.progress.steps.map((s) =>
+    s.state === "active" ? { ...s, state: "error" as const } : s
+  );
+
+  return {
+    kind: "progress",
+    title: base.title,
+    subtitle: base.subtitle,
+    progress: {
+      ...base.progress,
+      phase: "error",
+      error: msg ?? "Something went wrong",
+      steps,
+    },
+  };
+}
+function upsertWeatherProgress(
+  mutator: (prev?: ToolUI) => ToolUI,
+  setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>
+) {
+  setMessages((prev) => {
+    const next = [...prev];
+    const revIdx = [...next].reverse().findIndex(
+      (m) => m.role === "tool" && "toolUI" in m && m.toolUI.kind === "progress" && m.toolUI.progress?.tool === "getWeather"
+    );
+    if (revIdx === -1) {
+      next.push({ id: crypto.randomUUID(), role: "tool", toolUI: mutator(undefined) });
+      return next;
+    }
+    const idx = next.length - 1 - revIdx;
+    const cur = (next[idx] as Extract<ChatMessage, { role: "tool"; toolUI: ToolUI }>).toolUI;
+    next[idx] = { ...(next[idx] as Extract<ChatMessage, { role: "tool"; toolUI: ToolUI }>), toolUI: mutator(cur) };
+    return next;
+  });
+}
 
 /* --------------------------- Chat components ---------------------------- */
 
@@ -139,7 +271,6 @@ export default function App() {
     }
     return "light";
   });
-  const logoSrc = theme === "dark" ? "/logo-dark-theme.png" : "/logo-light-theme.png";
   useEffect(() => {
     const root = document.documentElement;
     root.classList.toggle("dark", theme === "dark");
@@ -153,10 +284,47 @@ export default function App() {
 
     client.onReady = (s: AgentState) => {
       if (!hydratedRef.current) {
-        // Only user/assistant are shown in UI
-        const restored: ChatMessage[] = (s.messages || [])
-          .filter((m) => m.role === "user" || m.role === "assistant")
-          .map((m) => ({ id: crypto.randomUUID(), role: m.role as "user" | "assistant", content: m.content }));
+        const restored: ChatMessage[] = [];
+        const rowsUnknown = Array.isArray(s.messages) ? (s.messages as unknown[]) : [];
+        for (const r of rowsUnknown) {
+          if (!isServerMsgRow(r)) continue;
+
+          if (r.role === "tool") {
+            // Tool rows are JSON-encoded by the worker
+            try {
+              const payload = JSON.parse(r.content) as unknown;
+              if (
+                isRecord(payload) &&
+                (payload as { tool?: unknown }).tool === "getWeather" &&
+                isWeatherResult((payload as { result?: unknown }).result)
+              ) {
+                // Show: finished progress then weather widget
+                restored.push({
+                  id: crypto.randomUUID(),
+                  role: "tool",
+                  toolUI: finalizeProgress(initialWeatherProgress()),
+                });
+                restored.push({
+                  id: crypto.randomUUID(),
+                  role: "tool",
+                  weather: (payload as { result: WeatherResult }).result,
+                });
+                continue;
+              }
+            } catch {
+              // ignore; fall through to neutral card
+            }
+            restored.push({
+              id: crypto.randomUUID(),
+              role: "tool",
+              toolUI: { kind: "generic", title: "Tool", subtitle: "Result available" },
+            });
+            continue;
+          }
+
+          // user/assistant
+          restored.push({ id: crypto.randomUUID(), role: r.role as "user" | "assistant", content: r.content });
+        }
         if (restored.length) setMessages(restored);
         hydratedRef.current = true;
       }
@@ -181,6 +349,35 @@ export default function App() {
       setMessages([]);
     };
 
+    // Tool events (weather)
+    client.onTool = (raw: unknown) => {
+      if (!isToolEvent(raw)) return;
+      const evt = raw;
+
+      if (evt.status === "started") {
+        setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "tool", toolUI: initialWeatherProgress() }]);
+      } else if (evt.status === "step") {
+        const msg = (evt.message ?? "").toLowerCase();
+        upsertWeatherProgress((prev) => {
+          const base = prev && prev.kind === "progress" ? prev : initialWeatherProgress();
+          if (msg.includes("fetch")) return markSequence(base, "fetch", ["plan"]);
+          if (msg.includes("pars")) return markSequence(base, "parse", ["plan", "fetch"]);
+          if (msg.includes("final")) return markSequence(base, "final", ["plan", "fetch", "parse"]);
+          return base;
+        }, setMessages);
+      } else if (evt.status === "done") {
+        upsertWeatherProgress((prev) => finalizeProgress(prev ?? initialWeatherProgress()), setMessages);
+        if (isWeatherResult(evt.result)) {
+          setMessages((prev) => [
+            ...prev,
+            { id: crypto.randomUUID(), role: "tool", weather: evt.result },
+          ]);
+        }
+      } else if (evt.status === "error") {
+        upsertWeatherProgress((prev) => errorProgress(prev ?? initialWeatherProgress(), evt.message), setMessages);
+      }
+    };
+
     (async () => {
       if (client.isOpen?.() || client.isConnecting?.()) return;
       try {
@@ -190,9 +387,7 @@ export default function App() {
       }
     })();
 
-    return () => {
-      /* keep WS open */
-    };
+    return () => { /* keep WS open */ };
   }, []);
 
   // auto-scroll
@@ -206,11 +401,8 @@ export default function App() {
     setPending(true);
     clientRef.current?.chat(text);
   }
-
   function resetChat() {
-    // ask the server to clear durable state
     clientRef.current?.reset?.();
-    // optional: also clear UI immediately
     setMessages([]);
   }
 
@@ -222,16 +414,16 @@ export default function App() {
       <div className="mx-auto grid min-h-svh w-full place-items-center p-4">
         <div className="w-full max-w-3xl">
           <header className="mb-3 flex items-center justify-between gap-3">
-          <a href="/" className="flex items-center gap-2 text-lg font-semibold">
-  <img
-    src={logoSrc}             // ← swap based on theme
-    alt="Logo"
-    className="h-6 w-6 rounded-lg"
-    loading="eager"
-    decoding="async"
-  />
-  <span>Chat Agent</span>
-</a>
+            <a href="/" className="flex items-center gap-2 text-lg font-semibold">
+              <img
+                src={theme === "dark" ? "/logo-dark-theme.png" : "/logo-light-theme.png"}
+                alt="Logo"
+                className="h-6 w-6 rounded-lg"
+                loading="eager"
+                decoding="async"
+              />
+              <span>Chat Agent</span>
+            </a>
             <div className="flex items-center gap-3">
               <button
                 className="btn"
@@ -252,25 +444,35 @@ export default function App() {
               <div ref={scrollRef} className="flex-1 overflow-y-auto px-1 py-2">
                 {messages.length === 0 ? (
                   <div className="grid h-full place-items-center">
-                    <div className="max-w-md text-center">
-                    <div className="grid h-full place-items-center">
-                      <div className="max-w-xl text-center leading-relaxed">
-                        <h2 className="mt-10 mb-1 text-2xl font-semibold">Cloudflare Chat Agent Starter</h2>
-                          <p className="mb-10 text-neutral-600 dark:text-neutral-300">
-      Minimal chat UI powered by <strong>Agents SDK</strong> + <strong>Workers AI</strong> with streaming and persistence.
-    </p>
-    <p className="mt-10 text-sm text-neutral-500 dark:text-neutral-400">Start typing below to get started!</p>
-  </div>
-</div>
+                    <div className="max-w-xl text-center leading-relaxed">
+                      <h2 className="mt-10 mb-1 text-2xl font-semibold">Cloudflare Chat Agent Starter</h2>
+                      <p className="mb-10 text-neutral-600 dark:text-neutral-300">
+                        Minimal chat UI powered by <strong>Agents SDK</strong> + <strong>Workers AI</strong> with streaming and persistence.
+                      </p>
+                      <p className="mt-10 text-sm text-neutral-500 dark:text-neutral-400">Start typing below to get started!</p>
                     </div>
                   </div>
                 ) : (
                   <div className="flex flex-col gap-3">
-                    {messages.map((m) => (
-                      <div key={m.id} className="px-1">
-                        <MessageBubble role={m.role}>{m.content}</MessageBubble>
-                      </div>
-                    ))}
+                    {messages.map((m) => {
+                      if (m.role === "tool") {
+                        // Render either the widget or a progress/generic card
+                        return "weather" in m ? (
+                          <div key={m.id} className="px-1">
+                            <WeatherWidget result={m.weather} />
+                          </div>
+                        ) : (
+                          <div key={m.id} className="px-1">
+                            <ToolCard ui={(m as Extract<ChatMessage, { toolUI: ToolUI }>).toolUI} />
+                          </div>
+                        );
+                      }
+                      return (
+                        <div key={m.id} className="px-1">
+                          <MessageBubble role={m.role}>{m.content}</MessageBubble>
+                        </div>
+                      );
+                    })}
                     {(() => {
                       const last = messages[messages.length - 1];
                       const showPending = pending && (!last || last.role !== "assistant");

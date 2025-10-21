@@ -1,5 +1,11 @@
 /// <reference lib="webworker" />
 import { Agent, type Connection, type ConnectionContext } from "agents";
+import {
+  getWeather,
+  getWeatherToolSchema,
+  type WeatherArgs,
+  type WeatherResult,
+} from "./tools/getWeather";
 
 /** Local shape for the Workers AI binding (narrow enough for chat) */
 type WorkersAiBinding = {
@@ -23,6 +29,24 @@ type AiChatMessage = {
   role: "system" | "user" | "assistant";
   content: string;
 };
+
+// Narrow shape for a tool-calling response from Workers AI
+type AiToolCall = {
+  function?: { name?: string; arguments?: unknown };
+};
+type AiPlanResponse = {
+  tool_calls?: AiToolCall[];
+};
+
+type ToolEvent =
+  | { type: "tool"; tool: "getWeather"; status: "started"; message?: string }
+  | { type: "tool"; tool: "getWeather"; status: "step";    message?: string }
+  | { type: "tool"; tool: "getWeather"; status: "done";    message?: string; result: WeatherResult }
+  | { type: "tool"; tool: "getWeather"; status: "error";   message: string };
+
+function emitTool(conn: Connection, evt: ToolEvent) {
+  conn.send(JSON.stringify(evt));
+}
 
 /** Single row we store (and mirror in state) */
 type Msg = { role: "user" | "assistant" | "tool"; content: string; ts: number };
@@ -115,17 +139,195 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
       // Build short AI history as AiChatMessage[] (no ts)
       const recentUA = this.state.messages.slice(-40).filter(isUserOrAssistant);
       const history: AiChatMessage[] = recentUA.map(({ role, content }) => ({ role, content }));
-      const system = "You are a helpful, concise chat agent. Keep replies short unless the user requests detail.";
 
+      // Hard-stop: tool inventory question → deterministic answer (no model call)
+      if (/\b(what|which)\s+tools?\b.*(have|can\s+you\s+use)|\btools\??$/i.test(userText)) {
+        const toolAnswer =
+          "I can use one tool:\n\n" +
+          "• **getWeather** — fetches a 7-day forecast from Open-Meteo when you ask about weather, temperatures, or rain.";
+        conn.send(JSON.stringify({ type: "delta", text: toolAnswer }));
+        conn.send(JSON.stringify({ type: "done" }));
+        await this.#saveAssistant(conn, toolAnswer);
+        return;
+      }
+
+      // --- Try planning a weather call first --------------------------------
+      const plannedArgs = await this.#tryPlanWeather(history, userText);
+      if (plannedArgs) {
+        // Small “I’m on it” assistant message (streamed + persisted)
+        const pre = `Sure — I’ll check the forecast using getWeather…`;
+        conn.send(JSON.stringify({ type: "delta", text: pre }));
+        conn.send(JSON.stringify({ type: "done" }));
+        await this.#saveAssistant(conn, pre);
+
+        // Progress (ephemeral events; UI will render in Step 3)
+        emitTool(conn, { type: "tool", tool: "getWeather", status: "started", message: "Planning…" });
+        emitTool(conn, { type: "tool", tool: "getWeather", status: "step",    message: "Fetching forecast from Open-Meteo…" });
+
+        // Execute tool
+        const res = await getWeather(plannedArgs);
+
+        if (!res.ok) {
+          // Keep UI concise; stop the spinner via an "error" phase
+          emitTool(conn, { type: "tool", tool: "getWeather", status: "error", message: res.error });
+          const errMsg = `I couldn't fetch the weather. Please check the location and try again.`;
+          conn.send(JSON.stringify({ type: "delta", text: errMsg }));
+          conn.send(JSON.stringify({ type: "done" }));
+          await this.#saveAssistant(conn, errMsg);
+          return;
+        }
+
+        // Done + result (ephemeral for UI)
+        emitTool(conn, { type: "tool", tool: "getWeather", status: "done", message: "Forecast ready", result: res });
+
+        // Persist a tool row so it survives refresh
+        const toolRow: Msg = {
+          role: "tool",
+          content: JSON.stringify({ type: "tool_result", tool: "getWeather", result: res }),
+          ts: Date.now(),
+        };
+        await this.sql`INSERT INTO messages (role, content, ts) VALUES ('tool', ${toolRow.content}, ${toolRow.ts})`;
+        this.setState({
+          ...this.state,
+          messages: [...this.state.messages, toolRow],
+          expiresAt: Date.now() + DAY,
+        });
+
+        // Deterministic “agentic” answer (umbrella/layers) — streamed + persisted
+        const summary = this.#summarizeWeatherIntent(userText, res);
+        conn.send(JSON.stringify({ type: "delta", text: summary }));
+        conn.send(JSON.stringify({ type: "done" }));
+        await this.#saveAssistant(conn, summary);
+        return;
+      }
+
+      // --- Otherwise, plain streaming chat ----------------------------------
+      const system = "You are a helpful, concise chat agent. Keep replies short unless the user requests detail.";
       const payload: AiChatMessage[] = [
         { role: "system", content: system },
         ...history,
         { role: "user", content: userText },
       ];
-
       await this.#streamAssistant(conn, payload);
     }
   }
+
+    /** Ask the model if we should call getWeather; returns parsed args or null */
+    async #tryPlanWeather(
+      history: AiChatMessage[],
+      userText: string
+    ): Promise<WeatherArgs | null> {
+      const system =
+        "You can call tools. If the user asks about weather/forecast/temperature/precipitation " +
+        "for a place or coordinates, call the getWeather tool with the right arguments. " +
+        "If a tool is not appropriate, do not call any tool.";
+  
+      const messages: AiChatMessage[] = [
+        { role: "system", content: system },
+        ...history,
+        { role: "user", content: userText },
+      ];
+  
+      // Workers AI accepts extra keys (tools, temperature, etc.)
+      const payload: { messages: AiChatMessage[] } & Record<string, unknown> = { messages };
+      payload.tools = [getWeatherToolSchema];
+      payload.temperature = 0.2;
+      payload.max_tokens = 200;
+  
+      try {
+        const ai = (this.env as EnvWithAI).AI;
+        const out = await ai.run(this.state.model || "@cf/meta/llama-4-scout-17b-16e-instruct", payload);
+        if (!out || typeof out !== "object") return null;
+
+        const calls = Array.isArray((out as AiPlanResponse).tool_calls)
+          ? (out as AiPlanResponse).tool_calls!
+          : [];
+        if (!calls.length) return null;
+  
+        const call = calls[0];
+        const fn = call?.function?.name;
+        if (fn !== "getWeather") return null;
+  
+        const rawArgs = call?.function?.arguments;
+        if (!rawArgs) return {};
+  
+        if (typeof rawArgs === "string") {
+          try { return JSON.parse(rawArgs) as WeatherArgs; } catch { return {}; }
+        }
+        if (typeof rawArgs === "object") return rawArgs as WeatherArgs;
+        return {};
+      } catch (e) {
+        console.log("[agent] planner(getWeather) error:", e instanceof Error ? e.message : String(e));
+        return null;
+      }
+    }
+  
+    /** Deterministic post-tool summary (answers umbrella/layers) without another model call */
+    #summarizeWeatherIntent(_userText: string, result: WeatherResult): string {
+      if (!result.ok) return `I couldn't fetch the weather. Please double-check the location.`;
+    
+      const { place, daily, units } = result;
+      const name =
+        [place.name, place.region, place.country].filter(Boolean).join(", ")
+        || "that location";
+      if (!daily.length) return `I couldn't find a daily forecast for ${name}.`;
+    
+      const days = daily.slice(0, Math.min(7, daily.length));
+    
+      // Aggregate simple signals
+      let hi = -Infinity, lo = Infinity, maxPop = -1;
+      for (const d of days) {
+        if (Number.isFinite(d.tMax) && d.tMax! > hi) hi = d.tMax!;
+        if (Number.isFinite(d.tMin) && d.tMin! < lo) lo = d.tMin!;
+        if (Number.isFinite(d.pop)  && d.pop!  > maxPop) maxPop = d.pop!;
+      }
+      const T = units.temp;
+      const hiR = Number.isFinite(hi) ? Math.round(hi) : null;
+      const loR = Number.isFinite(lo) ? Math.round(lo) : null;
+    
+      const lines: string[] = [];
+    
+      // Line 1: headline temps
+      if (hiR !== null && loR !== null) {
+        lines.push(`In ${name}, highs reach ~${hiR}${T} and lows dip to ~${loR}${T} this week.`);
+      } else if (hiR !== null) {
+        lines.push(`In ${name}, highs reach ~${hiR}${T} this week.`);
+      } else if (loR !== null) {
+        lines.push(`In ${name}, lows dip to ~${loR}${T} this week.`);
+      } else {
+        lines.push(`In ${name}, typical seasonal temperatures this week.`);
+      }
+    
+      // Line 2: precip guidance (umbrella/rain gear only when indicated)
+      if (maxPop >= 70) {
+        lines.push(`Rain is likely (peak chance ~${Math.round(maxPop)}%) — pack rain gear (umbrella or waterproof jacket).`);
+      } else if (maxPop >= 40) {
+        lines.push(`Some showers possible (peak ~${Math.round(maxPop)}%) — consider a light rain jacket.`);
+      } else {
+        lines.push(`Low rain risk overall.`);
+      }
+    
+      // Line 3: clothing tips based on warmth/cold and range
+      if (hiR !== null && hiR >= 30) {
+        lines.push(`It’ll feel hot — dress light and use sunscreen.`);
+      } else if (hiR !== null && hiR >= 24 && maxPop < 40) {
+        lines.push(`Warm and mostly dry — shorts and light layers are fine.`);
+      } else if (loR !== null && loR <= 5) {
+        lines.push(`Chilly at times — bring warm layers (and gloves/hat if you get cold easily).`);
+      } else if (hiR !== null && loR !== null) {
+        const range = hiR - loR;
+        if (range >= 10) lines.push(`Temps swing through the day — pack layers.`);
+        else lines.push(`Mild, steady temps — simple layers should be fine.`);
+      }
+    
+      // Optional snow-ish hint: if it's near/below freezing and precip risk is high
+      if (loR !== null && loR <= 0 && maxPop >= 50) {
+        lines.push(`Freezing conditions possible with precipitation — use winter shoes/boots.`);
+      }
+    
+      return lines.join(" ");
+    }
+  
 
   // ---------------------- Streaming chat ------------------------------------
 
