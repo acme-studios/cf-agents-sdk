@@ -141,11 +141,7 @@ wrangler tail
 
 You'll see tool decisions, execution logs, and any errors.
 
-## Limitations
 
-- **Model**: Llama 3.1 8B is good but not perfect. Upgrade to GPT-4 or Claude for better results.
-- **Wikipedia**: Only fetches article summaries, not full content.
-- **Rate Limits**: External APIs may have rate limits (though we haven't hit them).
 
 ## Upgrading the Model
 
@@ -153,8 +149,6 @@ To use a different model, update `DEFAULT_MODEL` in `worker/agent.ts`:
 
 ```typescript
 const DEFAULT_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
-// or
-const DEFAULT_MODEL = "@cf/openai/gpt-4"; // if available
 ```
 
 ## License
