@@ -1,15 +1,12 @@
 /// <reference lib="webworker" />
-/**
- * Open-Meteo tool (geocode + daily forecast)
- * - Deterministic shape with friendly units
- * - Conservative timeouts + clear console logs
- */
+// Weather tool using Open-Meteo API
+// Geocodes location, fetches 7-day forecast
 
 export type WeatherArgs = {
-    location?: string;                  // e.g., "Vancouver"
-    lat?: number;                       // optional: direct coords
+    location?: string;
+    lat?: number;
     lon?: number;
-    units?: "metric" | "imperial";      // default "metric"
+    units?: "metric" | "imperial";
   };
   
   export type WeatherResult =
@@ -140,7 +137,7 @@ export type WeatherArgs = {
     }
   }
   
-  /** Tool schema (optional: for future planner calls) */
+  // Tool schema for Workers AI
   export const getWeatherToolSchema = {
     type: "function",
     function: {

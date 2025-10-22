@@ -1,6 +1,4 @@
-// worker/tools/getWiki.ts
-
-/** Args accepted by the Wikipedia tool */
+// Wikipedia tool - searches and fetches article summaries
 export type WikiArgs = {
     /** Free-form query, e.g. "Ada Lovelace", "Rust (programming language)" */
     query: string;
@@ -76,12 +74,12 @@ export type WikiArgs = {
       const page = json.content_urls.desktop.page;
       if (typeof page === "string") return page;
     }
-    // Fallback
+    // Build URL manually if needed
     const slug = title.replace(/\s/g, "_");
     return `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(slug)}`;
   }
   
-  /** Optional thumbnail URL from REST summary safely */
+  // Extract thumbnail URL if available
   function extractThumb(json: unknown): string | undefined {
     if (isRecord(json) && isRecord(json.thumbnail) && typeof json.thumbnail.source === "string") {
       return json.thumbnail.source;
@@ -100,12 +98,12 @@ export type WikiArgs = {
     const lang = (args.lang || "en").toLowerCase();
   
     if (!query) return { ok: false, error: "Missing query." };
-    // Accept en or pt-br style codes; reject obviously broken values
+    // Validate language code
     if (!/^[a-z]{2}(-[a-z]{2})?$/i.test(lang)) {
       return { ok: false, error: `Invalid language: ${lang}` };
     }
   
-    // 1) Resolve a page title with Opensearch (best-effort)
+    // Search for the page title
     const searchUrl = `https://${lang}.wikipedia.org/w/api.php?action=opensearch&format=json&limit=1&namespace=0&search=${encodeURIComponent(
         query
     )}`;
@@ -115,7 +113,7 @@ try {
   const sr = await fetch(searchUrl, {
     headers: {
       Accept: "application/json",
-      // UA for Wikimedia
+      // User agent for Wikimedia
       "User-Agent": "cf-chat-agent-starter/1.0 (+https://developers.cloudflare.com/)",
     },
   });
@@ -123,15 +121,15 @@ try {
     const j = (await sr.json()) as unknown;
     title = parseOpensearchTopTitle(j) || query;
   } else {
-    // Don’t fail hard on search; just use the raw query as title
+    // If search fails, use query as-is
     title = query;
   }
 } catch {
-  // Network/CORS/etc: keep using the raw query as title
+  // On error, use query as-is
   title = query;
 }
   
-    // 2) Fetch REST summary for the title
+    // Fetch article summary
     const summaryUrl = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
   
     try {

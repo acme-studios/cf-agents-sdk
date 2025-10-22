@@ -15,9 +15,9 @@ import {
   type WikiResult,
 } from "./tools/getWiki";
 
-import { getISS, type IssResult } from "./tools/getISS";
+import { getISS, getISSToolSchema, type IssResult } from "./tools/getISS";
 
-/** Local shape for the Workers AI binding (narrow enough for chat) */
+// Workers AI binding type - just what we need for chat
 type WorkersAiBinding = {
   run: (
     model: string,
@@ -31,16 +31,16 @@ type WorkersAiBinding = {
   ) => Promise<ReadableStream<Uint8Array> | object | string | null | undefined>;
 };
 
-/** Extend the ambient Env (from worker-configuration.d.ts) with our AI binding */
+// Add AI to the base Env type
 type EnvWithAI = Env & { AI: WorkersAiBinding };
 
-/** Minimal AI chat message type for Workers AI input (no ts here) */
+// Chat message format for the AI model (no timestamp needed)
 type AiChatMessage = {
   role: "system" | "user" | "assistant";
   content: string;
 };
 
-/** Narrow shape for a tool-calling response from Workers AI */
+// Tool call response structure from the AI
 type AiToolCall = {
   function?: { name?: string; arguments?: unknown };
 };
@@ -66,13 +66,13 @@ function emitTool(conn: Connection, evt: ToolEvent) {
   conn.send(JSON.stringify(evt));
 }
 
-/** Single row we store (and mirror in state) */
+// Message row stored in DB and state
 type Msg = { role: "user" | "assistant" | "tool"; content: string; ts: number };
 
-/** Durable Object state */
+// DO state structure
 type State = {
   model: string;
-  messages: Msg[]; // persisted rows (include ts)
+  messages: Msg[]; // all messages with timestamps
   createdAt: number;
   expiresAt: number;
 };
@@ -80,7 +80,7 @@ type State = {
 const DAY = 86_400_000;
 const DEFAULT_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
 
-/** Helpers */
+// Helper functions
 function isReadableStream(x: unknown): x is ReadableStream<Uint8Array> {
   return !!x && typeof (x as { getReader?: unknown }).getReader === "function";
 }
@@ -141,7 +141,7 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
       const userText = (data.text || "").trim();
       if (!userText) return;
 
-      // Persist user row (our Msg includes ts)
+      // Save user message to DB
       const now = Date.now();
       await this.sql`INSERT INTO messages (role, content, ts) VALUES ('user', ${userText}, ${now})`;
       const userMsg: Msg = { role: "user", content: userText, ts: now };
@@ -152,35 +152,23 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
         expiresAt: Date.now() + DAY,
       });
 
-      // Build short AI history as AiChatMessage[] (no ts)
+      // Grab recent messages for context (last 40, no timestamps)
       const recentUA = this.state.messages.slice(-40).filter(isUserOrAssistant);
       const history: AiChatMessage[] = recentUA.map(({ role, content }) => ({ role, content }));
 
-      // Deterministic answer for "what tools do you have?"
-      if (/\b(what|which)\s+tools?\b.*(have|can\s+you\s+use)|\btools\??$/i.test(userText)) {
-        const toolAnswer =
-          "I have access to these tools:\n\n" +
-          "• **getWeather** — fetches a 7-day forecast from Open-Meteo when you ask about weather, temperatures, or rain.\n" +
-          "• **getWiki** — looks up a concise summary from Wikipedia for people, places, things, or concepts.\n" +
-          "• **getISS** — fetches the current position of the International Space Station.\n";
-        conn.send(JSON.stringify({ type: "delta", text: toolAnswer }));
-        conn.send(JSON.stringify({ type: "done" }));
-        await this.#saveAssistant(conn, toolAnswer);
-        return;
-      }
+      // Let the model decide what to do - no hardcoded patterns
+      // It can call a tool or just chat naturally
+      console.log("[agent] phase-3: invoking unified planner for tool selection");
+      const toolPlan = await this.#planWithAllTools(history, userText);
 
-      // --- If the user asks about the ISS, fetch live position (no planner) ---
-      if (
-        /\b(?:iss|international\s+space\s+station)\b/i.test(userText) ||
-        /\bwhere\s+is\s+the\s+(?:iss|space\s+station)\b/i.test(userText) ||
-        /\btrack(?:ing)?\s+(?:iss|space\s+station)\b/i.test(userText)
-      ) {
+      // ISS tool execution
+      if (toolPlan?.tool === "getISS") {
+        console.log("[agent] phase-3: executing getISS based on model decision");
         const pre = `Let me check the ISS position…`;
         conn.send(JSON.stringify({ type: "delta", text: pre }));
         conn.send(JSON.stringify({ type: "done" }));
         await this.#saveAssistant(conn, pre);
 
-        // Progress (ephemeral)
         emitTool(conn, { type: "tool", tool: "getISS", status: "started", message: "Understanding intent…" });
         emitTool(conn, { type: "tool", tool: "getISS", status: "step",    message: "Fetching live position…" });
 
@@ -195,10 +183,8 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
           return;
         }
 
-        // Done + result (ephemeral)
         emitTool(conn, { type: "tool", tool: "getISS", status: "done", message: "Position updated", result: res });
 
-        // Persist a tool row so it survives refresh
         const toolRow: Msg = {
           role: "tool",
           content: JSON.stringify({ type: "tool_result", tool: "getISS", result: res }),
@@ -211,7 +197,8 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
           expiresAt: Date.now() + DAY,
         });
 
-        // Deterministic one-shot summary (no extra model call)
+        // Use template for summary - model kept hallucinating placeholder values
+        console.log("[agent] phase-4: using deterministic summary for ISS (reliable)");
         const summary = this.#summarizeISS(res);
         conn.send(JSON.stringify({ type: "delta", text: summary }));
         conn.send(JSON.stringify({ type: "done" }));
@@ -219,9 +206,10 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
         return;
       }
 
-      // 1) Try planning a weather call
-      const plannedWeather = await this.#tryPlanWeather(history, userText);
-      if (plannedWeather) {
+      // Weather tool execution
+      if (toolPlan?.tool === "getWeather") {
+        console.log("[agent] phase-3: executing getWeather based on model decision");
+        const plannedWeather = toolPlan.args as WeatherArgs;
         const pre = "Sure — I’ll check the forecast using getWeather…";
         conn.send(JSON.stringify({ type: "delta", text: pre }));
         conn.send(JSON.stringify({ type: "done" }));
@@ -255,6 +243,8 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
           expiresAt: Date.now() + DAY,
         });
 
+        // Use template for summary - model kept hallucinating placeholder values
+        console.log("[agent] phase-4: using deterministic summary for Weather (reliable)");
         const summary = this.#summarizeWeatherIntent(res);
         conn.send(JSON.stringify({ type: "delta", text: summary }));
         conn.send(JSON.stringify({ type: "done" }));
@@ -262,9 +252,10 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
         return;
       }
 
-      // 2) Try planning a Wikipedia call
-      const plannedWiki = await this.#tryPlanWiki(history, userText);
-      if (plannedWiki) {
+      // Wiki tool execution
+      if (toolPlan?.tool === "getWiki") {
+        console.log("[agent] phase-3: executing getWiki based on model decision");
+        const plannedWiki = toolPlan.args as WikiArgs;
         const pre = "Let me look that up on Wikipedia…";
         conn.send(JSON.stringify({ type: "delta", text: pre }));
         conn.send(JSON.stringify({ type: "done" }));
@@ -298,6 +289,8 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
           expiresAt: Date.now() + DAY,
         });
 
+        // Use template for summary - model kept hallucinating placeholder values
+        console.log("[agent] phase-4: using deterministic summary for Wiki (reliable)");
         const summary = this.#summarizeWiki(res);
         conn.send(JSON.stringify({ type: "delta", text: summary }));
         conn.send(JSON.stringify({ type: "done" }));
@@ -305,8 +298,19 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
         return;
       }
 
-      // 3) Otherwise, plain streaming chat
-      const system = "You are a friendly, helpful chat agent. Keep replies concise unless the user requests more details.";
+      // No tool needed, just chat
+      console.log("[agent] phase-3: no tool selected, proceeding with regular chat");
+      
+      // Tell the model what tools it has so it can explain them if asked
+      const system = 
+        "You are a friendly, helpful chat agent. Keep replies concise unless the user requests more details.\n\n" +
+        "You have access to these tools that you can use when appropriate:\n" +
+        "- getWeather: Fetch 7-day weather forecasts for any location\n" +
+        "- getWiki: Look up information about people, places, things, or concepts from Wikipedia\n" +
+        "- getISS: Get the current position of the International Space Station\n\n" +
+        "When users ask about your capabilities or what you can do, naturally mention these tools. " +
+        "However, you don't need to call these tools right now - just have a conversation.";
+      
       const payload: AiChatMessage[] = [
         { role: "system", content: system },
         ...history,
@@ -316,15 +320,26 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
     }
   }
 
-  /** Ask the model if we should call getWeather; returns parsed args or null */
-  async #tryPlanWeather(
+  // Unified tool planner - one model call to decide which tool (if any) to use
+  // Replaces the old sequential checking approach with agentic decision making
+  // Returns null if no tool is needed, otherwise returns tool name + args
+  async #planWithAllTools(
     history: AiChatMessage[],
     userText: string
-  ): Promise<WeatherArgs | null> {
+  ): Promise<{ tool: "getWeather" | "getWiki" | "getISS"; args: unknown } | null> {
+    console.log("[agent] unified-planner: evaluating tools for user input:", userText.slice(0, 60));
+
     const system =
-      "You can call tools. If the user asks about weather/forecast/temperature/precipitation " +
-      "for a place or coordinates, call the getWeather tool with the right arguments. " +
-      "If a tool is not appropriate, do not call any tool.";
+      "You are a helpful assistant with access to tools. Analyze the user's request and decide if any tool is appropriate.\n\n" +
+      "Available tools:\n" +
+      "- getWeather: Use when user asks about weather, forecast, temperature, or precipitation for a location.\n" +
+      "- getWiki: Use when user asks about a person, place, thing, concept, organization, event, or any factual information. " +
+      "  For Wikipedia, extract the main subject as the query. Examples:\n" +
+      "  * 'How many titles did Real Madrid win?' → query: 'Real Madrid'\n" +
+      "  * 'Tell me about Ada Lovelace' → query: 'Ada Lovelace'\n" +
+      "  * 'What is machine learning?' → query: 'Machine learning'\n" +
+      "- getISS: Use when user asks about the International Space Station location, position, or tracking.\n\n" +
+      "If no tool is needed, do not call any tool. Only call one tool at a time.";
 
     const messages: AiChatMessage[] = [
       { role: "system", content: system },
@@ -332,107 +347,171 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
       { role: "user", content: userText },
     ];
 
+    // Send all tool schemas to the model
     const payload: { messages: AiChatMessage[] } & Record<string, unknown> = { messages };
-    payload.tools = [getWeatherToolSchema];
+    payload.tools = [getWeatherToolSchema, getWikiToolSchema, getISSToolSchema];
     payload.temperature = 0.2;
     payload.max_tokens = 200;
 
     try {
       const ai = (this.env as EnvWithAI).AI;
       const out = await ai.run(this.state.model || DEFAULT_MODEL, payload);
-      if (!out || typeof out !== "object") return null;
 
-      const calls = Array.isArray((out as AiPlanResponse).tool_calls)
-        ? (out as AiPlanResponse).tool_calls!
-        : [];
-      if (!calls.length) return null;
-
-      const call = calls[0];
-      const fn = call?.function?.name;
-      if (fn !== "getWeather") return null;
-
-      const rawArgs = call?.function?.arguments;
-      if (!rawArgs) return {};
-
-      if (typeof rawArgs === "string") {
-        try { return JSON.parse(rawArgs) as WeatherArgs; } catch { return {}; }
-      }
-      if (typeof rawArgs === "object") return rawArgs as WeatherArgs;
-      return {};
-    } catch (e) {
-      console.log("[agent] planner(getWeather) error:", e instanceof Error ? e.message : String(e));
-      return null;
-    }
-  }
-
-  /** Ask the model if we should call getWiki; returns parsed args or null */
-  async #tryPlanWiki(
-    history: AiChatMessage[],
-    userText: string
-  ): Promise<WikiArgs | null> {
-    const system =
-      "You can call tools. If the user asks about a person, place, thing, concept, or 'what is/are ...', " +
-      "call the getWiki tool with a concise query. If a tool is not appropriate, do not call any tool.";
-  
-    const messages: AiChatMessage[] = [
-      { role: "system", content: system },
-      ...history,
-      { role: "user", content: userText },
-    ];
-  
-    const payload: { messages: AiChatMessage[] } & Record<string, unknown> = { messages };
-    payload.tools = [getWikiToolSchema];
-    payload.temperature = 0.2;
-    payload.max_tokens = 200;
-  
-    try {
-      const ai = (this.env as EnvWithAI).AI;
-      const out = await ai.run(this.state.model || DEFAULT_MODEL, payload);
-      if (!out || typeof out !== "object") return null;
-  
-      const calls = Array.isArray((out as AiPlanResponse).tool_calls)
-        ? (out as AiPlanResponse).tool_calls!
-        : [];
-      if (!calls.length) return null;
-  
-      const call = calls[0];
-      const fn = call?.function?.name;
-      if (fn !== "getWiki") return null;
-  
-      const rawArgs = call?.function?.arguments;
-      if (!rawArgs) return null;
-  
-      // validate helper: ensure query is a non-empty string
-      const validate = (x: unknown): WikiArgs | null => {
-        if (!x || typeof x !== "object") return null;
-        const q = (x as { query?: unknown }).query;
-        if (typeof q === "string" && q.trim()) {
-          const langVal = (x as { lang?: unknown }).lang;
-          return typeof langVal === "string" && langVal.trim()
-            ? { query: q.trim(), lang: langVal.trim() }
-            : { query: q.trim() };
-        }
+      if (!out || typeof out !== "object") {
+        console.log("[agent] unified-planner: no valid response from model");
         return null;
-      };
-  
+      }
+
+      const calls = Array.isArray((out as AiPlanResponse).tool_calls)
+        ? (out as AiPlanResponse).tool_calls!
+        : [];
+
+      if (!calls.length) {
+        console.log("[agent] unified-planner: no tool_calls in response, no tool needed");
+        return null;
+      }
+
+      const call = calls[0];
+      const toolName = call?.function?.name;
+
+      // Make sure it's a valid tool
+      if (!toolName || !["getWeather", "getWiki", "getISS"].includes(toolName)) {
+        console.log("[agent] unified-planner: invalid or unknown tool name:", toolName);
+        return null;
+      }
+
+      const rawArgs = call?.function?.arguments;
+
+      // Log what the model decided
+      console.log("[agent] unified-planner: model decided tool:", toolName, "with args:", 
+        typeof rawArgs === "string" ? rawArgs.slice(0, 100) : JSON.stringify(rawArgs).slice(0, 100));
+
+      // Parse args and validate per tool
+      let parsedArgs: unknown = rawArgs;
+
       if (typeof rawArgs === "string") {
         try {
-          const parsed = JSON.parse(rawArgs) as unknown;
-          return validate(parsed);
-        } catch {
-          return null;
+          parsedArgs = JSON.parse(rawArgs);
+        } catch (e) {
+          console.log("[agent] unified-planner: failed to parse args JSON:", e instanceof Error ? e.message : String(e));
+          parsedArgs = {};
         }
       }
-  
-      if (typeof rawArgs === "object") return validate(rawArgs);
+
+      // Validate args per tool
+      if (toolName === "getWeather") {
+        // Weather args are flexible, getWeather handles defaults
+        return { tool: "getWeather", args: parsedArgs };
+      }
+
+      if (toolName === "getWiki") {
+        // Wiki needs a query string
+        console.log("[agent] unified-planner: getWiki selected, validating args:", JSON.stringify(parsedArgs));
+        if (parsedArgs && typeof parsedArgs === "object") {
+          const query = (parsedArgs as { query?: unknown }).query;
+          if (typeof query === "string" && query.trim()) {
+            console.log("[agent] unified-planner: valid getWiki args with query:", query.slice(0, 50));
+            return { tool: "getWiki", args: parsedArgs };
+          } else {
+            console.log("[agent] unified-planner: getWiki query field missing or invalid, query value:", query);
+          }
+        } else {
+          console.log("[agent] unified-planner: getWiki parsedArgs is not an object:", typeof parsedArgs);
+        }
+        console.log("[agent] unified-planner: getWiki selected but missing valid query, ignoring");
+        return null;
+      }
+
+      if (toolName === "getISS") {
+        // ISS doesn't need args
+        console.log("[agent] unified-planner: valid getISS call (no args needed)");
+        return { tool: "getISS", args: {} };
+      }
+
       return null;
     } catch (e) {
-      console.log("[agent] planner(getWiki) error:", e instanceof Error ? e.message : String(e));
+      console.log("[agent] unified-planner: exception during planning:", e instanceof Error ? e.message : String(e));
       return null;
     }
   }
 
-  /** Deterministic post-tool summary (no extra model call) */
+  // AGENTIC SYNTHESIS (DISABLED)
+  // Tried letting the model generate summaries from tool results, but Llama 3.1 8B
+  // keeps hallucinating placeholders like ".°N" instead of actual values like "46.61°N"
+  // Keeping this code for when we upgrade to a better model (GPT-4, Claude, etc.)
+  
+  /* Agentic synthesis - disabled due to model hallucinations */
+  /* async #synthesizeToolResponse(
+    conn: Connection,
+    history: AiChatMessage[],
+    userText: string,
+    toolName: string,
+    toolResult: unknown
+  ): Promise<void> {
+    console.log("[agent] phase-4: synthesizing agentic response for tool:", toolName);
+    console.log("[agent] phase-4: tool result data:", JSON.stringify(toolResult).slice(0, 200));
+
+    // Convert tool result to plain text format (easier for model to parse than JSON)
+    let dataText = "";
+    
+    if (toolName === "getISS" && toolResult && typeof toolResult === "object") {
+      const iss = toolResult as IssResult;
+      if (iss.ok) {
+        dataText = 
+          `ISS Location Data:\n` +
+          `- Latitude: ${iss.lat.toFixed(2)} degrees\n` +
+          `- Longitude: ${iss.lon.toFixed(2)} degrees\n` +
+          (iss.altitude_km ? `- Altitude: ${Math.round(iss.altitude_km)} kilometers\n` : "") +
+          (iss.velocity_kmh ? `- Velocity: ${Math.round(iss.velocity_kmh)} km/h\n` : "") +
+          (iss.visibility ? `- Visibility: ${iss.visibility}\n` : "");
+      }
+    } else if (toolName === "getWeather" && toolResult && typeof toolResult === "object") {
+      const weather = toolResult as WeatherResult;
+      if (weather.ok) {
+        const loc = [weather.place.name, weather.place.region, weather.place.country].filter(Boolean).join(", ");
+        dataText = `Weather Forecast for ${loc}:\n`;
+        weather.daily.slice(0, 7).forEach((day, i) => {
+          dataText += `Day ${i + 1}: High ${day.tMax}°${weather.units.temp}, Low ${day.tMin}°${weather.units.temp}, Rain chance ${day.pop}%\n`;
+        });
+      }
+    } else if (toolName === "getWiki" && toolResult && typeof toolResult === "object") {
+      const wiki = toolResult as WikiResult;
+      if (wiki.ok) {
+        dataText = `Wikipedia Article: ${wiki.title}\n\nSummary:\n${wiki.extract || "No summary available"}`;
+      }
+    } else {
+      // Fallback to JSON if we can't parse
+      dataText = JSON.stringify(toolResult, null, 2);
+    }
+
+    console.log("[agent] phase-4: formatted data text:", dataText.slice(0, 200));
+
+    // Build a comprehensive system prompt
+    const system =
+      "You are a helpful assistant. You just received data from a tool and need to provide a natural response.\n\n" +
+      "CRITICAL: Use the EXACT numbers and text provided in the data. Do NOT use placeholders like '.' or ','.\n" +
+      "If you see 'Latitude: 46.61 degrees', say '46.61 degrees' - use the actual number.\n" +
+      "Be conversational and helpful, but always use real values from the data.";
+
+    const toolResultMessage = 
+      `Here is the data I retrieved:\n\n${dataText}\n\n` +
+      `User's question was: "${userText}"\n\n` +
+      `Please provide a helpful, natural response using the ACTUAL values from the data above.`;
+
+    const messages: AiChatMessage[] = [
+      { role: "system", content: system },
+      ...history.slice(-4), // Keep last 2 exchanges for context
+      { role: "user", content: toolResultMessage },
+    ];
+
+    console.log("[agent] phase-4: sending synthesis prompt, message length:", toolResultMessage.length);
+
+    // Stream the synthesized response
+    await this.#streamAssistant(conn, messages);
+  } */
+
+  // Deterministic summaries - these work reliably with actual values
+  // Using templates instead of model generation due to hallucination issues
   #summarizeWeatherIntent(result: WeatherResult): string {
     if (!result.ok) return "I couldn't fetch the weather. Please double-check the location.";
 
@@ -489,17 +568,15 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
     return lines.join(" ");
   }
 
-  /** Deterministic post-tool summary for Wiki (no extra model call) */
   #summarizeWiki(result: WikiResult): string {
     if (!result.ok) return `I couldn't fetch Wikipedia: ${result.error}`;
     const title = result.title || "Summary";
-    const text = (result.extract || "").trim(); // <-- uses `extract` from WikiOk
+    const text = (result.extract || "").trim();
     if (!text) return `${title} — summary unavailable.`;
     const snippet = text.length > 480 ? text.slice(0, 480).trimEnd() + "…" : text;
     return `${title} — ${snippet}`;
   }
 
-  /** Deterministic summary for ISS result */
   #summarizeISS(result: IssResult): string {
     if (!result.ok) return `I couldn't fetch the ISS position: ${result.error}`;
     const lat = result.lat.toFixed(2);
@@ -511,7 +588,7 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
     return `The ISS is currently near ${lat}°, ${lon}° at ~${alt}, moving ~${vel} (visibility: ${vis}).`;
   }
 
-  // ---------------------- Streaming chat ------------------------------------
+  // Stream assistant response
   async #streamAssistant(conn: Connection, messages: AiChatMessage[]) {
     let full = "";
     try {

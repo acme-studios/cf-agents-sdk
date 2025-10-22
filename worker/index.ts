@@ -8,7 +8,7 @@ export default {
     void _ctx;
     const url = new URL(request.url);
 
-    // Agents WS/HTTP
+    // Handle agent WebSocket/HTTP requests
     const routed = await (routeAgentRequest as unknown as (req: Request, env: Env) => Promise<Response | null>)(request, env);
     if (routed) return routed;
 
@@ -18,7 +18,7 @@ export default {
       });
     }
 
-    // SPA / static
+    // Serve static files
     return env.ASSETS.fetch(request);
   },
 } satisfies ExportedHandler<Env & { ASSETS: AssetsBinding }>;

@@ -1,24 +1,16 @@
-// worker/tools/getISS.ts
+// ISS tracker tool - fetches current position of the space station
 
-/** Input accepted by the ISS tool (kept minimal for now) */
-export type IssArgs = Record<string, never>; // no args yet
-
-/** Live position from where the ISS is right now */
+export type IssArgs = Record<string, never>; // no args needed
 export type IssOk = {
   ok: true;
   lat: number;
   lon: number;
-  /** km above sea level */
   altitude_km?: number;
-  /** km/h */
   velocity_kmh?: number;
-  /** "daylight" | "eclipsed" when available */
   visibility?: string;
-  /** Unix ms timestamp when fetched */
   ts: number;
 };
 
-/** Error shape */
 export type IssErr = { ok: false; error: string };
 
 export type IssResult = IssOk | IssErr;
@@ -32,17 +24,13 @@ export const getISSToolSchema = {
       "Fetch the International Space Station's current position (latitude/longitude) and basic telemetry.",
     parameters: {
       type: "object",
-      properties: {}, // no parameters needed
+      properties: {},
       additionalProperties: false,
     },
   },
 } as const;
 
-/**
- * Implementation:
- * Uses the public where-the-ISS-at API.
- * https://api.wheretheiss.at/v1/satellites/25544
- */
+// Uses wheretheiss.at API to get live ISS position
 export async function getISS(): Promise<IssResult> {
     const url = "https://api.wheretheiss.at/v1/satellites/25544";
   
