@@ -159,9 +159,10 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
       // Deterministic answer for "what tools do you have?"
       if (/\b(what|which)\s+tools?\b.*(have|can\s+you\s+use)|\btools\??$/i.test(userText)) {
         const toolAnswer =
-          "I can use two tools:\n\n" +
+          "I have access to these tools:\n\n" +
           "• **getWeather** — fetches a 7-day forecast from Open-Meteo when you ask about weather, temperatures, or rain.\n" +
-          "• **getWiki** — looks up a concise summary from Wikipedia for people, places, things, or concepts.";
+          "• **getWiki** — looks up a concise summary from Wikipedia for people, places, things, or concepts.\n" +
+          "• **getISS** — fetches the current position of the International Space Station.\n";
         conn.send(JSON.stringify({ type: "delta", text: toolAnswer }));
         conn.send(JSON.stringify({ type: "done" }));
         await this.#saveAssistant(conn, toolAnswer);
