@@ -15,6 +15,8 @@ import {
   type WikiResult,
 } from "./tools/getWiki";
 
+import { getISS, type IssResult } from "./tools/getISS";
+
 /** Local shape for the Workers AI binding (narrow enough for chat) */
 type WorkersAiBinding = {
   run: (
@@ -48,13 +50,17 @@ type AiPlanResponse = {
 
 type ToolEvent =
   | { type: "tool"; tool: "getWeather"; status: "started"; message?: string }
-  | { type: "tool"; tool: "getWeather"; status: "step"; message?: string }
-  | { type: "tool"; tool: "getWeather"; status: "done"; message?: string; result: WeatherResult }
-  | { type: "tool"; tool: "getWeather"; status: "error"; message: string }
-  | { type: "tool"; tool: "getWiki"; status: "started"; message?: string }
-  | { type: "tool"; tool: "getWiki"; status: "step"; message?: string }
-  | { type: "tool"; tool: "getWiki"; status: "done"; message?: string; result: WikiResult }
-  | { type: "tool"; tool: "getWiki"; status: "error"; message: string };
+  | { type: "tool"; tool: "getWeather"; status: "step";    message?: string }
+  | { type: "tool"; tool: "getWeather"; status: "done";    message?: string; result: WeatherResult }
+  | { type: "tool"; tool: "getWeather"; status: "error";   message: string }
+  | { type: "tool"; tool: "getWiki";    status: "started"; message?: string }
+  | { type: "tool"; tool: "getWiki";    status: "step";    message?: string }
+  | { type: "tool"; tool: "getWiki";    status: "done";    message?: string; result: WikiResult }
+  | { type: "tool"; tool: "getWiki";    status: "error";   message: string }
+  | { type: "tool"; tool: "getISS";     status: "started"; message?: string }
+  | { type: "tool"; tool: "getISS";     status: "step";    message?: string }
+  | { type: "tool"; tool: "getISS";     status: "done";    message?: string; result: IssResult }
+  | { type: "tool"; tool: "getISS";     status: "error";   message: string };
 
 function emitTool(conn: Connection, evt: ToolEvent) {
   conn.send(JSON.stringify(evt));
@@ -159,6 +165,56 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
         conn.send(JSON.stringify({ type: "delta", text: toolAnswer }));
         conn.send(JSON.stringify({ type: "done" }));
         await this.#saveAssistant(conn, toolAnswer);
+        return;
+      }
+
+      // --- If the user asks about the ISS, fetch live position (no planner) ---
+      if (
+        /\b(?:iss|international\s+space\s+station)\b/i.test(userText) ||
+        /\bwhere\s+is\s+the\s+(?:iss|space\s+station)\b/i.test(userText) ||
+        /\btrack(?:ing)?\s+(?:iss|space\s+station)\b/i.test(userText)
+      ) {
+        const pre = `Let me check the ISS position…`;
+        conn.send(JSON.stringify({ type: "delta", text: pre }));
+        conn.send(JSON.stringify({ type: "done" }));
+        await this.#saveAssistant(conn, pre);
+
+        // Progress (ephemeral)
+        emitTool(conn, { type: "tool", tool: "getISS", status: "started", message: "Understanding intent…" });
+        emitTool(conn, { type: "tool", tool: "getISS", status: "step",    message: "Fetching live position…" });
+
+        const res = await getISS();
+
+        if (!res.ok) {
+          emitTool(conn, { type: "tool", tool: "getISS", status: "error", message: res.error });
+          const err = `I couldn't fetch the ISS position. Please try again in a moment.`;
+          conn.send(JSON.stringify({ type: "delta", text: err }));
+          conn.send(JSON.stringify({ type: "done" }));
+          await this.#saveAssistant(conn, err);
+          return;
+        }
+
+        // Done + result (ephemeral)
+        emitTool(conn, { type: "tool", tool: "getISS", status: "done", message: "Position updated", result: res });
+
+        // Persist a tool row so it survives refresh
+        const toolRow: Msg = {
+          role: "tool",
+          content: JSON.stringify({ type: "tool_result", tool: "getISS", result: res }),
+          ts: Date.now(),
+        };
+        await this.sql`INSERT INTO messages (role, content, ts) VALUES ('tool', ${toolRow.content}, ${toolRow.ts})`;
+        this.setState({
+          ...this.state,
+          messages: [...this.state.messages, toolRow],
+          expiresAt: Date.now() + DAY,
+        });
+
+        // Deterministic one-shot summary (no extra model call)
+        const summary = this.#summarizeISS(res);
+        conn.send(JSON.stringify({ type: "delta", text: summary }));
+        conn.send(JSON.stringify({ type: "done" }));
+        await this.#saveAssistant(conn, summary);
         return;
       }
 
@@ -440,6 +496,18 @@ export default class AIAgent extends Agent<EnvWithAI, State> {
     if (!text) return `${title} — summary unavailable.`;
     const snippet = text.length > 480 ? text.slice(0, 480).trimEnd() + "…" : text;
     return `${title} — ${snippet}`;
+  }
+
+  /** Deterministic summary for ISS result */
+  #summarizeISS(result: IssResult): string {
+    if (!result.ok) return `I couldn't fetch the ISS position: ${result.error}`;
+    const lat = result.lat.toFixed(2);
+    const lon = result.lon.toFixed(2);
+    const alt = typeof result.altitude_km === "number" ? `${Math.round(result.altitude_km)} km` : "unknown";
+    const vel = typeof result.velocity_kmh === "number" ? `${Math.round(result.velocity_kmh)} km/h` : "unknown";
+    const vis = result.visibility ? result.visibility : "n/a";
+
+    return `The ISS is currently near ${lat}°, ${lon}° at ~${alt}, moving ~${vel} (visibility: ${vis}).`;
   }
 
   // ---------------------- Streaming chat ------------------------------------

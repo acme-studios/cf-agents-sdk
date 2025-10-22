@@ -3,11 +3,11 @@
 /** Progress types */
 export type StepState = "idle" | "active" | "done" | "error";
 export type ToolProgress = {
-  tool: "getWeather" | "getWiki";
-  phase: "running" | "done" | "error";
-  steps: Array<{ key: string; label: string; state: StepState; note?: string }>;
-  error?: string;
-};
+    tool: "getWeather" | "getWiki" | "getISS";
+    phase: "running" | "done" | "error";
+    steps: Array<{ key: string; label: string; state: StepState; note?: string }>;
+    error?: string;
+  };
 
 /** Agnostic tool UI envelope */
 export type ToolUI =

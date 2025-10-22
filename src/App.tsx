@@ -3,6 +3,8 @@ import { AgentClient, type AgentState } from "./agent/wsClient";
 import { ToolCard, type ToolUI } from "./components/chat/ToolCard";
 import { WeatherWidget } from "./components/chat/WeatherWidget";
 import { WikiWidget } from "./components/chat/WikiWidget";
+import { ISSWidget } from "./components/chat/ISSWidget";
+import type { IssResult } from "../worker/tools/getISS";
 
 import type { WeatherResult } from "../worker/tools/getWeather";
 import type { WikiResult } from "../worker/tools/getWiki";
@@ -72,12 +74,14 @@ export type ChatMessage =
   | { id: string; role: "user" | "assistant"; content: string }
   | { id: string; role: "tool"; toolUI: ToolUI }
   | { id: string; role: "tool"; weather: WeatherResult }
-  | { id: string; role: "tool"; wiki: WikiResult };
+  | { id: string; role: "tool"; wiki: WikiResult }
+  | { id: string; role: "tool"; iss: IssResult };
 
 /** Tool events the WS can deliver */
 type ToolEvent =
   | { type: "tool"; tool: "getWeather"; status: "started" | "step" | "done" | "error"; message?: string; result?: WeatherResult }
-  | { type: "tool"; tool: "getWiki";    status: "started" | "step" | "done" | "error"; message?: string; result?: WikiResult };
+  | { type: "tool"; tool: "getWiki";    status: "started" | "step" | "done" | "error"; message?: string; result?: WikiResult }
+  | { type: "tool"; tool: "getISS";     status: "started" | "step" | "done" | "error"; message?: string; result?: IssResult };
 
 /* ------------------------- Type guards / helpers ------------------------ */
 
@@ -101,7 +105,7 @@ function isToolEvent(v: unknown): v is ToolEvent {
   if (v.type !== "tool") return false;
   const tool = v.tool;
   const status = v.status;
-  const toolOk = tool === "getWeather" || tool === "getWiki";
+  const toolOk = tool === "getWeather" || tool === "getWiki" || tool === "getISS";
   const statusOk = status === "started" || status === "step" || status === "done" || status === "error";
   return toolOk && statusOk;
 }
@@ -115,6 +119,20 @@ function isWikiResult(v: unknown): v is WikiResult {
   if (!isRecord(v) || typeof v.ok !== "boolean") return false;
   if (v.ok === false) return hasStr(v, "error");
   return hasStr(v, "title") && hasStr(v, "extract") && hasStr(v, "pageUrl") && hasStr(v, "lang");
+}
+function isIssResult(v: unknown): v is IssResult {
+  if (!isRecord(v)) return false;
+  if (typeof (v as Record<string, unknown>).ok !== "boolean") return false;
+
+  const r = v as Record<string, unknown>;
+  if (r.ok === false) return typeof r.error === "string";
+
+  // ok === true: flat structure { ok, lat, lon, altitude_km?, velocity_kmh?, visibility?, ts }
+  return (
+    typeof r.lat === "number" &&
+    typeof r.lon === "number" &&
+    typeof r.ts === "number"
+  );
 }
 
 /* --------------------------- Progress helpers --------------------------- */
@@ -154,6 +172,23 @@ function initialWikiProgress(): ToolUI {
     },
   };
 }
+
+function initialISSProgress(): ToolUI {
+  return {
+    kind: "progress",
+    title: "ISS Tracker",
+    progress: {
+      tool: "getISS",
+      phase: "running",
+      steps: [
+        { key: "plan",  label: "Understand request", state: "active" as StepState },
+        { key: "fetch", label: "Fetch position",     state: "idle"   as StepState },
+        { key: "final", label: "Finalize",           state: "idle"   as StepState },
+      ],
+    },
+  };
+}
+
 function setStepState(ui: ToolUI, key: string, state: StepState): ToolUI {
   if (ui.kind !== "progress") return ui;
   const steps = ui.progress.steps.map((s) => (s.key === key ? { ...s, state } : s));
@@ -180,7 +215,7 @@ function errorProgress(ui?: ToolUI, msg?: string): ToolUI {
   };
 }
 function upsertProgressFor(
-  tool: "getWeather" | "getWiki",
+  tool: "getWeather" | "getWiki" | "getISS",
   init: () => ToolUI,
   mutator: (prev?: ToolUI) => ToolUI,
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>
@@ -295,7 +330,7 @@ export default function App() {
             // Tool rows are JSON-encoded by the worker
             try {
               const payload = JSON.parse(r.content) as unknown;
-
+          
               // Weather restore
               if (
                 isRecord(payload) &&
@@ -306,14 +341,13 @@ export default function App() {
                 restored.push({ id: crypto.randomUUID(), role: "tool", weather: (payload as { result: WeatherResult }).result });
                 continue;
               }
-
+          
               // Wiki restore
               if (
                 isRecord(payload) &&
                 payload.tool === "getWiki" &&
                 isWikiResult((payload as { result?: unknown }).result)
               ) {
-                // optional: show a tiny finished progress card for parity
                 restored.push({
                   id: crypto.randomUUID(),
                   role: "tool",
@@ -322,11 +356,30 @@ export default function App() {
                 restored.push({ id: crypto.randomUUID(), role: "tool", wiki: (payload as { result: WikiResult }).result });
                 continue;
               }
+          
+              // ISS restore
+              if (
+                isRecord(payload) &&
+                payload.tool === "getISS" &&
+                isIssResult((payload as { result?: unknown }).result)
+              ) {
+                restored.push({
+                  id: crypto.randomUUID(),
+                  role: "tool",
+                  toolUI: finalizeProgress(initialISSProgress()),
+                });
+                restored.push({ id: crypto.randomUUID(), role: "tool", iss: (payload as { result: IssResult }).result });
+                continue;
+              }
             } catch {
               // ignore; fallthrough to neutral card
             }
-
-            restored.push({ id: crypto.randomUUID(), role: "tool", toolUI: { kind: "generic", title: "Tool", subtitle: "Result available" } });
+          
+            restored.push({
+              id: crypto.randomUUID(),
+              role: "tool",
+              toolUI: { kind: "generic", title: "Tool", subtitle: "Result available" },
+            });
             continue;
           }
 
@@ -413,6 +466,32 @@ export default function App() {
           }
         } else if (evt.status === "error") {
           upsertProgressFor("getWiki", initialWikiProgress, (prev) => errorProgress(prev, evt.message), setMessages);
+        }
+      }
+
+      if (evt.tool === "getISS") {
+        if (evt.status === "started") {
+          setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "tool", toolUI: initialISSProgress() }]);
+        } else if (evt.status === "step") {
+          const msg = (evt.message ?? "").toLowerCase();
+          upsertProgressFor(
+            "getISS",
+            initialISSProgress,
+            (prev) => {
+              const base = prev && prev.kind === "progress" ? prev : initialISSProgress();
+              if (msg.includes("fetch"))  return markSequence(base, "fetch", ["plan"]);
+              if (msg.includes("final"))  return markSequence(base, "final", ["plan", "fetch"]);
+              return base;
+            },
+            setMessages
+          );
+        } else if (evt.status === "done") {
+          upsertProgressFor("getISS", initialISSProgress, (prev) => finalizeProgress(prev), setMessages);
+          if (evt.result && isIssResult(evt.result)) {
+            setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "tool", iss: evt.result } as ChatMessage]);
+          }
+        } else if (evt.status === "error") {
+          upsertProgressFor("getISS", initialISSProgress, (prev) => errorProgress(prev, evt.message), setMessages);
         }
       }
     };
@@ -509,6 +588,13 @@ export default function App() {
                           return (
                             <div key={m.id} className="px-1">
                               <WikiWidget result={m.wiki} />
+                            </div>
+                          );
+                        }
+                        if ("iss" in m) {
+                          return (
+                            <div key={m.id} className="px-1">
+                              <ISSWidget result={m.iss} />
                             </div>
                           );
                         }

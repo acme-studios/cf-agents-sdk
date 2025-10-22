@@ -9,16 +9,23 @@ export type AgentState = {
 export type WeatherResult = import("../../worker/tools/getWeather").WeatherResult;
 export type WikiResult    = import("../../worker/tools/getWiki").WikiResult;
 
-/** Tool event shape (weather + wiki) */
+/** Tool event shape (weather, wiki, iss) */
 export type ToolEvent =
+  // Weather
   | { type: "tool"; tool: "getWeather"; status: "started"; message?: string }
   | { type: "tool"; tool: "getWeather"; status: "step";    message?: string }
-  | { type: "tool"; tool: "getWeather"; status: "done";    message?: string; result: WeatherResult }
+  | { type: "tool"; tool: "getWeather"; status: "done";    message?: string; result: unknown }
   | { type: "tool"; tool: "getWeather"; status: "error";   message: string }
+  // Wikipedia
   | { type: "tool"; tool: "getWiki";    status: "started"; message?: string }
   | { type: "tool"; tool: "getWiki";    status: "step";    message?: string }
-  | { type: "tool"; tool: "getWiki";    status: "done";    message?: string; result: WikiResult }
-  | { type: "tool"; tool: "getWiki";    status: "error";   message: string };
+  | { type: "tool"; tool: "getWiki";    status: "done";    message?: string; result: unknown }
+  | { type: "tool"; tool: "getWiki";    status: "error";   message: string }
+  // ISS tracker
+  | { type: "tool"; tool: "getISS";     status: "started"; message?: string }
+  | { type: "tool"; tool: "getISS";     status: "step";    message?: string }
+  | { type: "tool"; tool: "getISS";     status: "done";    message?: string; result: unknown }
+  | { type: "tool"; tool: "getISS";     status: "error";   message: string };
 
 export class AgentClient {
   private ws: WebSocket | null = null;
